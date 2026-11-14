@@ -1,0 +1,52 @@
+name: Sync Cask
+
+on:
+  schedule:
+    - cron: "15 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    name: Auto-update Homebrew Casks
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check latest MailChat release & update Casks/mailchat.rb
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG=$(gh release view --repo arrake0101/mailchat --json tagName --jq '.tagName')
+          VERSION="${TAG#v}"
+
+          TMP_SHA=$(mktemp)
+          gh release download "$TAG" --repo arrake0101/mailchat -p "SHA256SUMS.txt" -O "$TMP_SHA"
+
+          ARM_SHA=$(awk -v f="MailChat_${VERSION}_aarch64.dmg" '$2 == f { print $1 }' "$TMP_SHA")
+          INTEL_SHA=$(awk -v f="MailChat_${VERSION}_x64.dmg" '$2 == f { print $1 }' "$TMP_SHA")
+          rm -f "$TMP_SHA"
+
+          if [ -z "$ARM_SHA" ] || [ -z "$INTEL_SHA" ]; then
+            echo "DMG hashes not found in SHA256SUMS.txt for version $VERSION" >&2
+            exit 1
+          fi
+
+          sed -i -E "s/version \"[^\"]+\"/version \"${VERSION}\"/" Casks/mailchat.rb
+          sed -i -E "s/arm:[[:space:]]+\"[^\"]+\"/arm:   \"${ARM_SHA}\"/" Casks/mailchat.rb
+          sed -i -E "s/intel:[[:space:]]+\"[^\"]+\"/intel: \"${INTEL_SHA}\"/" Casks/mailchat.rb
+
+          if git diff --quiet Casks/mailchat.rb; then
+            echo "Casks/mailchat.rb is already up to date (${VERSION})."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Casks/mailchat.rb
+          git commit -m "chore(cask): bump mailchat to ${VERSION}"
+          git push origin main
