@@ -8,6 +8,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: sync-cask
+  cancel-in-progress: true
+
 jobs:
   sync:
     name: Auto-update Homebrew Casks
@@ -21,24 +25,68 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          TAG=$(gh release view --repo arrake0101/mailchat --json tagName --jq '.tagName')
+          TAG="$(gh release view --repo arrake0101/mailchat --json tagName --jq '.tagName')"
           VERSION="${TAG#v}"
 
-          TMP_SHA=$(mktemp)
-          gh release download "$TAG" --repo arrake0101/mailchat -p "SHA256SUMS.txt" -O "$TMP_SHA"
+          TMP_DIR="$(mktemp -d)"
+          trap 'rm -rf "$TMP_DIR"' EXIT
+          gh release download "$TAG" \
+            --repo arrake0101/mailchat \
+            --pattern "SHA256SUMS.txt" \
+            --dir "$TMP_DIR" \
+            --clobber
 
-          ARM_SHA=$(awk -v f="MailChat_${VERSION}_aarch64.dmg" '$2 == f { print $1 }' "$TMP_SHA")
-          INTEL_SHA=$(awk -v f="MailChat_${VERSION}_x64.dmg" '$2 == f { print $1 }' "$TMP_SHA")
-          rm -f "$TMP_SHA"
+          ARM_SHA="$(awk -v f="MailChat_${VERSION}_aarch64.dmg" '$2 == f || $2 == "*"f { print tolower($1) }' "$TMP_DIR/SHA256SUMS.txt" | head -n1)"
+          INTEL_SHA="$(awk -v f="MailChat_${VERSION}_x64.dmg" '$2 == f || $2 == "*"f { print tolower($1) }' "$TMP_DIR/SHA256SUMS.txt" | head -n1)"
 
-          if [ -z "$ARM_SHA" ] || [ -z "$INTEL_SHA" ]; then
-            echo "DMG hashes not found in SHA256SUMS.txt for version $VERSION" >&2
+          if [[ ! "$ARM_SHA" =~ ^[0-9a-f]{64}$ ]] || [[ ! "$INTEL_SHA" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "Valid DMG SHA256 hashes not found in SHA256SUMS.txt for version $VERSION (arm='$ARM_SHA', intel='$INTEL_SHA')" >&2
             exit 1
           fi
 
-          sed -i -E "s/version \"[^\"]+\"/version \"${VERSION}\"/" Casks/mailchat.rb
-          sed -i -E "s/arm:[[:space:]]+\"[^\"]+\"/arm:   \"${ARM_SHA}\"/" Casks/mailchat.rb
-          sed -i -E "s/intel:[[:space:]]+\"[^\"]+\"/intel: \"${INTEL_SHA}\"/" Casks/mailchat.rb
+          export VERSION ARM_SHA INTEL_SHA
+          python3 - <<'PY'
+          import os, textwrap
+
+          ver = os.environ["VERSION"]
+          h_arm = os.environ["ARM_SHA"]
+          h_x64 = os.environ["INTEL_SHA"]
+
+          cask = textwrap.dedent(f"""\
+              cask "mailchat" do
+                version "{ver}"
+
+                on_arm do
+                  sha256 "{h_arm}"
+                  url "https://github.com/arrake0101/mailchat/releases/download/v#{{version}}/MailChat_#{{version}}_aarch64.dmg"
+                end
+                on_intel do
+                  sha256 "{h_x64}"
+                  url "https://github.com/arrake0101/mailchat/releases/download/v#{{version}}/MailChat_#{{version}}_x64.dmg"
+                end
+
+                name "MailChat"
+                desc "Instant-messaging style desktop email client with declarative config.toml"
+                homepage "https://github.com/arrake0101/mailchat"
+
+                app "MailChat.app"
+
+                postflight do
+                  system_command "/usr/bin/xattr",
+                                 args: ["-cr", "#{{appdir}}/MailChat.app"],
+                                 sudo: false
+                end
+
+                zap trash: [
+                  "~/Library/Application Support/com.mailchat.app",
+                  "~/Library/Caches/com.mailchat.app",
+                  "~/Library/Preferences/com.mailchat.app.plist",
+                ]
+              end
+          """)
+          with open("Casks/mailchat.rb", "w", encoding="utf-8", newline="\n") as f:
+              f.write(cask)
+          PY
 
           if git diff --quiet Casks/mailchat.rb; then
             echo "Casks/mailchat.rb is already up to date (${VERSION})."
@@ -49,4 +97,5 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add Casks/mailchat.rb
           git commit -m "chore(cask): bump mailchat to ${VERSION}"
+          git pull --rebase origin main
           git push origin main
